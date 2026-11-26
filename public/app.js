@@ -7,7 +7,10 @@ import StorageManager from './managers/storage.js';
 import SettingsManager from './managers/settings.js'
 import ConfirmationManager from './managers/confirmation.js';
 import { PreviewManager } from './managers/preview.js';
-import { marked } from '/js/marked/marked.esm.js';
+import { marked } from './js/marked/marked.esm.js';
+
+const appBasePath = window.DUMBPAD_BASE_PATH || '';
+const appPath = (value) => `${appBasePath}${value.startsWith('/') ? value : `/${value}`}`;
 
 document.addEventListener('DOMContentLoaded', async () => {
     const DEBUG = false;
@@ -144,7 +147,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     async function fetchWithPin(url, options = {}) {
         options.credentials = 'same-origin';
         try {
-            return fetch(url, options); 
+            const requestUrl = typeof url === 'string' && url.startsWith('/') && !url.startsWith('//')
+                ? appPath(url)
+                : url;
+            const response = await fetch(requestUrl, options);
+            if (response.status === 401) {
+                const returnTo = `${window.location.pathname}${window.location.search}`;
+                window.location.replace(`${appPath('/login')}?redirect=${encodeURIComponent(returnTo)}`);
+            }
+            return response;
         } 
         catch (error) {
             console.log(error);
@@ -765,13 +776,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Save notes with debounce
     async function saveNotes(content, isAutoSave, showStatus = true) {
         try {
-            await fetchWithPin(`/api/notes/${currentNotepadId}`, {
+            const response = await fetchWithPin(`/api/notes/${currentNotepadId}`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({ content }),
             });
+            if (response?.status === 401) return;
+            if (!response?.ok) throw new Error('Note save request failed');
             
             if (collaborationManager.ws && collaborationManager.ws.readyState === WebSocket.OPEN && !collaborationManager.isReceivingUpdate) {
                 collaborationManager.ws.send(JSON.stringify({
@@ -1249,7 +1262,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Register PWA Service Worker
         if ("serviceWorker" in navigator) {
            try {
-               const registration = await navigator.serviceWorker.register("/service-worker.js");
+               const registration = await navigator.serviceWorker.register(appPath('/service-worker.js'), {
+                   scope: appPath('/')
+               });
                console.log("Service Worker registered:", registration.scope);
                
                // Get the current app version from config
@@ -1432,7 +1447,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         addEventListeners();
         appSettings = settingsManager.loadSettings();
 
-        fetch(`/api/config`)
+        fetch(appPath('/api/config'))
             .then(response => response.json())
             .then(config => { // Load config and initialize markdown functionality
                 if (config.error) throw new Error(config.error);

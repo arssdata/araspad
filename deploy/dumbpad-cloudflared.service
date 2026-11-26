@@ -1,0 +1,23 @@
+[Unit]
+Description=Cloudflare Quick Tunnel for DumbPad
+After=network-online.target dumbpad.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:3001 --no-autoupdate
+Restart=always
+RestartSec=5s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

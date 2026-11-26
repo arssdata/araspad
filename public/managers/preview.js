@@ -6,6 +6,9 @@
  * - Adding copy buttons to code blocks
  * - Handling resizable split view
  */
+const appBasePath = window.DUMBPAD_BASE_PATH || '';
+const appPath = (value) => `${appBasePath}${value.startsWith('/') ? value : `/${value}`}`;
+
 export class PreviewManager {
     constructor({
         editor,
@@ -631,8 +634,8 @@ export class PreviewManager {
         
         // Determine which theme CSS to load
         const themeCss = theme === 'dark' 
-            ? '/css/@highlightjs/github-dark.min.css'
-            : '/css/@highlightjs/github.min.css';
+            ? appPath('/css/@highlightjs/github-dark.min.css')
+            : appPath('/css/@highlightjs/github.min.css');
         
         // Create and append new theme link
         const link = document.createElement('link');
@@ -650,7 +653,7 @@ export class PreviewManager {
         this.updateHighlightTheme(currentTheme);
 
         // Import hljs once for the entire method
-        const { default: hljs } = await import('/js/@highlightjs/highlight.min.js');
+        const { default: hljs } = await import(appPath('/js/@highlightjs/highlight.min.js'));
 
         // Detect languages in the markdown content
         const detectedLanguages = new Set();
@@ -669,7 +672,7 @@ export class PreviewManager {
                 const importPromises = languagesToLoad.map(async (lang) => {
                     const langAlias = lang === 'html' ? 'xml' : lang; // Use 'xml' for HTML syntax highlighting
                     try {
-                        const module = await import(`/js/@highlightjs/languages/${langAlias}.min.js`);
+                        const module = await import(appPath(`/js/@highlightjs/languages/${langAlias}.min.js`));
                         if (module && module.default) {
                             return { lang, module: module.default };
                         }
@@ -696,9 +699,9 @@ export class PreviewManager {
         }
 
         // Import and configure marked extensions
-        const { markedHighlight } = await import('/js/marked-highlight/index.js');
-        const markedExtendedTables = (await import('/js/marked-extended-tables/index.js')).default;
-        const markedAlert = (await import('/js/marked-alert/index.js')).default;
+        const { markedHighlight } = await import(appPath('/js/marked-highlight/index.js'));
+        const markedExtendedTables = (await import(appPath('/js/marked-extended-tables/index.js'))).default;
+        const markedAlert = (await import(appPath('/js/marked-alert/index.js'))).default;
 
         this.marked.use(markedHighlight({
             langPrefix: 'hljs language-',
@@ -726,7 +729,7 @@ export class PreviewManager {
      */
     async loadAdditionalLanguages(markdownContent) {
         // Import hljs to check if we have it initialized
-        const { default: hljs } = await import('/js/@highlightjs/highlight.min.js');
+        const { default: hljs } = await import(appPath('/js/@highlightjs/highlight.min.js'));
 
         // Detect languages in the new content
         const detectedLanguages = new Set();
@@ -749,7 +752,7 @@ export class PreviewManager {
                 const importPromises = languagesToLoad.map(async (lang) => {
                     const langAlias = lang === 'html' ? 'xml' : lang;
                     try {
-                        const module = await import(`/js/@highlightjs/languages/${langAlias}.min.js`);
+                        const module = await import(appPath(`/js/@highlightjs/languages/${langAlias}.min.js`));
                         if (module && module.default) {
                             return { lang, module: module.default };
                         }

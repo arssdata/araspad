@@ -32,23 +32,29 @@ const ASSETS_DIR = path.join(PUBLIC_DIR, "Assets");
 const NOTEPADS_FILE = path.join(DATA_DIR, 'notepads.json');
 const SITE_TITLE = process.env.SITE_TITLE || 'DumbPad';
 const PIN = process.env.DUMBPAD_PIN;
+const AUTH_SECRET = process.env.DUMBPAD_AUTH_SECRET || PIN;
 const COOKIE_NAME = 'dumbpad_auth';
 const COOKIE_MAX_AGE = process.env.COOKIE_MAX_AGE || 24; // default 24 in hours
 const cookieMaxAge = COOKIE_MAX_AGE * 60 * 60 * 1000; // in hours
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const BASE_PATH = (process.env.BASE_PATH || '/note').replace(/\/+$/, '');
 const PAGE_HISTORY_COOKIE = 'dumbpad_page_history';
 const PAGE_HISTORY_COOKIE_AGE = process.env.PAGE_HISTORY_COOKIE_AGE || 365; // defaults to 1 Year in days
 const pageHistoryCookieAge = PAGE_HISTORY_COOKIE_AGE * 24 * 60 * 60 * 1000;
 const MAX_FILENAME_COLLISION_ATTEMPTS = 100; // Maximum attempts to resolve filename collisions
+const COMPLETION_WEBHOOK_URL = process.env.DUMBPAD_COMPLETION_WEBHOOK_URL || '';
+const WEBHOOK_DELIVERIES_FILE = path.join(DATA_DIR, 'completion-webhook-deliveries.json');
 
 let notepads_cache = {
     notepads: [],
     index: null,
 };
+const noteSaveQueues = new Map();
+let deliveryLedgerQueue = Promise.resolve();
 const packageJson = require('./package.json');
 const VERSION = packageJson.version || '1.0.0';
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, '127.0.0.1', () => {
     console.log(`Server is running on port ${PORT}`);
     console.log(`Base URL: ${BASE_URL}`);
     console.log(`Environment: ${NODE_ENV}`);
@@ -142,6 +148,31 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.use(cookieParser());
 
+// Mount the app under BASE_PATH without changing the existing root deployment.
+app.use((req, res, next) => {
+    if (BASE_PATH && req.method === 'GET' && req.path === BASE_PATH) {
+        const queryIndex = req.originalUrl.indexOf('?');
+        const query = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : '';
+        return res.redirect(308, `${BASE_PATH}/${query}`);
+    }
+    next();
+});
+app.use((req, res, next) => {
+    const pathOnly = req.url.split('?')[0];
+    if (BASE_PATH && (pathOnly === BASE_PATH || pathOnly.startsWith(`${BASE_PATH}/`))) {
+        req.dumbpadBasePath = BASE_PATH;
+        req.url = req.url.slice(BASE_PATH.length) || '/';
+        req._parsedUrl = undefined;
+    }
+    next();
+});
+
+async function sendHtmlPage(req, res, filename) {
+    const html = await fs.readFile(path.join(PUBLIC_DIR, filename), 'utf8');
+    const basePath = req.dumbpadBasePath || '';
+    res.type('html').send(html.replace(/__DUMBPAD_BASE_PATH__/g, basePath));
+}
+
 // Serve static files
 app.use('/js/marked', express.static(
     path.join(__dirname, 'node_modules/marked/lib')
@@ -215,9 +246,11 @@ app.use(express.static(path.join(__dirname, 'public'), {
 const wss = new WebSocket.Server({ server, verifyClient: (info, done) => {
     const origin = info.req.headers.origin;
     const isOriginValid = validateOrigin(origin);
-    if (isOriginValid) done(true); // allow the connection
+    const cookies = require('cookie').parse(info.req.headers.cookie || '');
+    const isAuthenticated = !PIN || secureCompare(cookies[COOKIE_NAME], sessionCookie());
+    if (isOriginValid && isAuthenticated) done(true); // allow the connection
     else {
-        console.warn("Blocked connection from origin:", {origin});
+        console.warn("Blocked unauthenticated or invalid-origin WebSocket connection");
         done(false, 403, 'Forbidden'); // reject the connection
     }
 }});
@@ -421,7 +454,7 @@ setInterval(() => {
 
 // Validate PIN format
 function isValidPin(pin) {
-    return typeof pin === 'string' && /^\d{4,10}$/.test(pin);
+    return typeof pin === 'string' && /^[\x21-\x7e]{4,128}$/.test(pin);
 }
 
 // Constant-time string comparison to prevent timing attacks
@@ -438,25 +471,50 @@ function secureCompare(a, b) {
     }
 }
 
+function sessionCookie() {
+    return crypto.createHmac('sha256', AUTH_SECRET).update('dumbpad-session:' + PIN).digest('base64url');
+}
+
+function createReplyToken(notepadId, messageId) {
+    const payload = Buffer.from(JSON.stringify({ notepadId, messageId, exp: Date.now() + 2 * 60 * 60 * 1000 })).toString('base64url');
+    const signature = crypto.createHmac('sha256', AUTH_SECRET).update('reply:' + payload).digest('base64url');
+    return payload + '.' + signature;
+}
+
+function validReplyToken(token, notepadId) {
+    if (typeof token !== 'string' || token.length > 2048) return false;
+    const parts = token.split('.');
+    if (parts.length !== 2) return false;
+    const expected = crypto.createHmac('sha256', AUTH_SECRET).update('reply:' + parts[0]).digest('base64url');
+    if (!secureCompare(parts[1], expected)) return false;
+    try {
+        const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+        return payload.notepadId === notepadId && typeof payload.messageId === 'string' &&
+            Number.isFinite(payload.exp) && payload.exp > Date.now();
+    } catch (_) {
+        return false;
+    }
+}
+
 // Main app route with PIN & CORS check
-app.get('/', originValidationMiddleware, (req, res) => {
+app.get('/', originValidationMiddleware, (req, res, next) => {
     const pin = process.env.DUMBPAD_PIN;
     
     // Skip PIN if not configured
-    if (!pin || !isValidPin(pin)) {
-        return res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    if (!pin) {
+        return sendHtmlPage(req, res, 'index.html').catch(next);
     }
 
     // Check PIN cookie
     const authCookie = req.cookies[COOKIE_NAME];
-    if (!authCookie || !secureCompare(authCookie, pin)) {
+    if (!authCookie || !secureCompare(authCookie, sessionCookie())) {
         // Preserve the original URL with query parameters
         const originalUrl = req.originalUrl;
         const redirectParam = encodeURIComponent(originalUrl);
-        return res.redirect(`/login?redirect=${redirectParam}`);
+        return res.redirect(`${req.dumbpadBasePath || ''}/login?redirect=${redirectParam}`);
     }
 
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    return sendHtmlPage(req, res, 'index.html').catch(next);
 });
 
 // Serve the pwa/asset manifest
@@ -469,7 +527,7 @@ app.get("/manifest.json", (req, res) => {
 });
 
 // Helper function to validate redirect URLs for security
-function isValidRedirectUrl(url) {
+function isValidRedirectUrl(url, basePath = '') {
     if (!url || typeof url !== 'string') {
         return false;
     }
@@ -493,30 +551,34 @@ function isValidRedirectUrl(url) {
     if (url.includes('%2f') || url.includes('%2F') || url.includes('%5c') || url.includes('%5C')) {
         return false;
     }
+
+    if (basePath && url !== basePath && !url.startsWith(`${basePath}/`) && !url.startsWith(`${basePath}?`)) {
+        return false;
+    }
     
     return true;
 }
 
 // Login page route
-app.get('/login', (req, res) => {
+app.get('/login', (req, res, next) => {
     // If no PIN is required or user is already authenticated, redirect to main app
     const pin = process.env.DUMBPAD_PIN;
-    if (!pin || !isValidPin(pin) || (req.cookies[COOKIE_NAME] && secureCompare(req.cookies[COOKIE_NAME], pin))) {
+    if (!pin || (req.cookies[COOKIE_NAME] && secureCompare(req.cookies[COOKIE_NAME], sessionCookie()))) {
         // If user is already authenticated, redirect to the original URL if provided
         const redirectParam = req.query.redirect;
         if (redirectParam) {
             const decodedRedirect = decodeURIComponent(redirectParam);
-            if (isValidRedirectUrl(decodedRedirect)) {
+            if (isValidRedirectUrl(decodedRedirect, req.dumbpadBasePath || '')) {
                 return res.redirect(decodedRedirect);
             } else {
                 console.warn('Invalid redirect parameter blocked:', redirectParam);
-                return res.redirect('/');
+                return res.redirect(`${req.dumbpadBasePath || ''}/`);
             }
         }
-        return res.redirect('/');
+        return res.redirect(`${req.dumbpadBasePath || ''}/`);
     }
     
-    res.sendFile(path.join(__dirname, 'public', 'login.html'));
+    return sendHtmlPage(req, res, 'login.html').catch(next);
 });
 
 // Pin verification endpoint
@@ -558,10 +620,11 @@ app.post('/api/verify-pin', (req, res) => {
         resetAttempts(ip);
 
         // Set secure HTTP-only cookie
-        res.cookie(COOKIE_NAME, pin, {
+        res.cookie(COOKIE_NAME, sessionCookie(), {
             httpOnly: true,
             secure: req.secure || (BASE_URL.startsWith("https") && NODE_ENV === 'production'),
             sameSite: 'strict',
+            path: `${req.dumbpadBasePath || ''}/`,
             maxAge: cookieMaxAge
         });
         res.json({ success: true });
@@ -591,7 +654,7 @@ app.get('/api/pin-required', (req, res) => {
     }
     
     res.json({ 
-        required: !!PIN && isValidPin(PIN),
+        required: !!PIN,
         length: PIN ? PIN.length : 0,
         locked: ip ? isLockedOut(ip) : true
     });
@@ -609,15 +672,20 @@ app.get('/api/config', (req, res) => {
 
 // Pin protection middleware
 const requirePin = (req, res, next) => {
-    if (!PIN || !isValidPin(PIN)) {
+    if (!PIN) {
         return next();
     }
 
     const authCookie = req.cookies[COOKIE_NAME];
-    if (!authCookie || !secureCompare(authCookie, PIN)) {
-        return res.status(401).json({ error: 'Unauthorized' });
+    if (authCookie && secureCompare(authCookie, sessionCookie())) return next();
+
+    const match = req.path.match(/^\/notes\/(default|[0-9]+)$/);
+    const bearer = (req.get('Authorization') || '').match(/^Bearer ([A-Za-z0-9_.-]+)$/);
+    if (match && bearer && (req.method === 'GET' || req.method === 'POST') && validReplyToken(bearer[1], match[1])) {
+        req.replyAccess = true;
+        return next();
     }
-    next();
+    return res.status(401).json({ error: 'Unauthorized' });
 };
 
 // Apply pin protection to all /api routes except pin verification
@@ -837,6 +905,129 @@ fs.watch(NOTEPADS_FILE, () => indexNotepads());
     indexNotepads();
 })();
 
+function withNoteSaveLock(notepadId, operation) {
+    const previous = noteSaveQueues.get(notepadId) || Promise.resolve();
+    const current = previous.catch(() => {}).then(operation);
+    noteSaveQueues.set(notepadId, current);
+
+    return current.finally(() => {
+        if (noteSaveQueues.get(notepadId) === current) {
+            noteSaveQueues.delete(notepadId);
+        }
+    });
+}
+
+function getCompletedOwnerMessage(previousContent, nextContent) {
+    if (!nextContent.startsWith(previousContent)) return null;
+
+    const appendedText = nextContent.slice(previousContent.length).trim();
+    const match = appendedText.match(/^aras:\s*([\s\S]*?)\s*\/\/$/i);
+    if (!match || !match[1].trim()) return null;
+
+    return {
+        message: appendedText,
+        offset: previousContent.length,
+    };
+}
+
+function withDeliveryLedgerLock(operation) {
+    const queued = deliveryLedgerQueue.then(operation);
+    deliveryLedgerQueue = queued.catch(() => {});
+    return queued;
+}
+
+async function readDeliveryLedger() {
+    try {
+        const contents = await fs.readFile(WEBHOOK_DELIVERIES_FILE, 'utf8');
+        const ledger = JSON.parse(contents);
+        if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger)) {
+            throw new Error('Invalid completion webhook ledger');
+        }
+        return ledger;
+    } catch (error) {
+        if (error.code === 'ENOENT') return {};
+        throw error;
+    }
+}
+
+async function writeDeliveryLedger(ledger) {
+    const temporaryPath = `${WEBHOOK_DELIVERIES_FILE}.${process.pid}.tmp`;
+    await fs.writeFile(temporaryPath, JSON.stringify(ledger, null, 2), { mode: 0o600 });
+    await fs.rename(temporaryPath, WEBHOOK_DELIVERIES_FILE);
+}
+
+async function claimWebhookDelivery(messageId, notepadId) {
+    return withDeliveryLedgerLock(async () => {
+        const ledger = await readDeliveryLedger();
+        if (Object.prototype.hasOwnProperty.call(ledger, messageId)) return false;
+
+        ledger[messageId] = {
+            status: 'sending',
+            notepadId,
+            attemptedAt: new Date().toISOString(),
+        };
+        await writeDeliveryLedger(ledger);
+        return true;
+    });
+}
+
+async function updateWebhookDelivery(messageId, details) {
+    return withDeliveryLedgerLock(async () => {
+        const ledger = await readDeliveryLedger();
+        ledger[messageId] = { ...(ledger[messageId] || {}), ...details };
+        await writeDeliveryLedger(ledger);
+    });
+}
+
+async function sendCompletionWebhook(notepadId, completedMessage) {
+    if (!COMPLETION_WEBHOOK_URL) return;
+
+    const messageId = crypto.createHash('sha256')
+        .update(`${notepadId}\0${completedMessage.offset}\0${completedMessage.message}`)
+        .digest('hex');
+
+    try {
+        const claimed = await claimWebhookDelivery(messageId, notepadId);
+        if (!claimed) return;
+
+        const response = await fetch(COMPLETION_WEBHOOK_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Idempotency-Key': messageId,
+            },
+            body: JSON.stringify({
+                source: 'DumbPad',
+                notepadId,
+                messageId,
+                message: completedMessage.message,
+                ...(PIN ? { replyToken: createReplyToken(notepadId, messageId) } : {}),
+            }),
+            signal: AbortSignal.timeout(10000),
+        });
+
+        if (!response.ok) throw new Error(`Webhook returned HTTP ${response.status}`);
+
+        await updateWebhookDelivery(messageId, {
+            status: 'delivered',
+            deliveredAt: new Date().toISOString(),
+            httpStatus: response.status,
+        });
+        console.log('Completion webhook delivered', { notepadId, messageId });
+    } catch (error) {
+        try {
+            await updateWebhookDelivery(messageId, {
+                status: 'failed',
+                failedAt: new Date().toISOString(),
+                error: error.message,
+            });
+        } catch (ledgerError) {
+            console.error('Could not record completion webhook failure:', ledgerError.message);
+        }
+        console.error('Completion webhook delivery failed:', error.message);
+    }
+}
+
 /* API Endpoints */
 // Get list of notepads
 app.get('/api/notepads', async (req, res) => {
@@ -997,25 +1188,42 @@ app.get('/api/notes/:id', async (req, res) => {
 app.post('/api/notes/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        await ensureDataDir();
-        
-        // Find the notepad to get its current name
-        const { notepad } = await findNotepadById(id);
-        
-        let notePath;
-        if (notepad) {
-            // Use helper to find the correct file path
-            notePath = await getNotepadFilePath(notepad, DATA_DIR);
-        } else {
-            // Fallback to ID-based path for backwards compatibility (sanitize id for security)
-            const sanitizedId = sanitizeFilename(id);
-            notePath = path.join(DATA_DIR, `${sanitizedId}.txt`);
+        const { content } = req.body || {};
+        if (typeof content !== 'string') {
+            return res.status(400).json({ error: 'Note content must be a string' });
         }
-        
-        await fs.writeFile(notePath, req.body.content);
+        await ensureDataDir();
+
+        const completedMessage = await withNoteSaveLock(id, async () => {
+            // Read the persisted version before saving so repeat autosaves are ignored.
+            const { notepad } = await findNotepadById(id);
+            const notePath = notepad
+                ? await getNotepadFilePath(notepad, DATA_DIR)
+                : path.join(DATA_DIR, `${sanitizeFilename(id)}.txt`);
+            const previousContent = await fs.readFile(notePath, 'utf8').catch((error) => {
+                if (error.code === 'ENOENT') return '';
+                throw error;
+            });
+            if (req.replyAccess && (!notepad || !content.startsWith(previousContent) || !/^\nCue: [\s\S]+\n$/.test(content.slice(previousContent.length)))) {
+                const error = new Error('Reply must append to the existing note');
+                error.status = 409;
+                throw error;
+            }
+            const completed = getCompletedOwnerMessage(previousContent, content);
+
+            await fs.writeFile(notePath, content);
+            return completed;
+        });
+
         indexNotepads(); // update searching index
+
+        if (completedMessage) {
+            await sendCompletionWebhook(id, completedMessage);
+        }
+
         res.json({ success: true });
     } catch (err) {
+        if (err.status === 409) return res.status(409).json({ error: 'Note changed or reply is invalid' });
         res.status(500).json({ error: 'Error saving notes' });
     }
 });

@@ -1,0 +1,26 @@
+[Unit]
+Description=Monitor DumbPad Cloudflare Tunnel URL changes
+After=network-online.target dumbpad.service dumbpad-cloudflared.service
+Wants=network-online.target dumbpad.service dumbpad-cloudflared.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/dumbpad/notify.env
+StateDirectory=dumbpad-monitor
+StateDirectoryMode=0750
+ExecStart=/usr/bin/python3 -u /workspace/DumbPad/deploy/tunnel-url-monitor.py
+Restart=always
+RestartSec=5s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/workspace/DumbPad /var/lib/dumbpad-monitor
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

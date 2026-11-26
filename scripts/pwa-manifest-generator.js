@@ -34,10 +34,11 @@ function generatePWAManifest(siteTitle) {
   generateAssetManifest(); // fetched later in service-worker
 
   const pwaManifest = {
-    name: siteTitle,
+      name: siteTitle,
       short_name: siteTitle,
       description: "A simple notepad application",
-      start_url: "/",
+      start_url: "../",
+      scope: "../",
       display: "standalone",
       background_color: "#ffffff",
       theme_color: "#000000",

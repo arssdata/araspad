@@ -1,10 +1,12 @@
 let APP_VERSION = "1.0.0"; // Default version, will be updated by server
+const appBasePath = new URL(self.registration.scope).pathname.replace(/\/$/, '');
+const appPath = (value) => `${appBasePath}${value.startsWith('/') ? value : `/${value}`}`;
 
 const getCacheName = (version) => `DUMBPAD_CACHE_${version}`;
 
 const getConfig = async () => {
   try {
-    const response = await fetch("/api/config");
+    const response = await fetch(appPath('/api/config'));
     const data = await response.json();
     return data;
   } catch (error) {
@@ -49,17 +51,17 @@ const installNewCache = async (version) => {
   const cache = await caches.open(cacheName);
   
   try {
-    const response = await fetch("/asset-manifest.json");
+    const response = await fetch(appPath('/asset-manifest.json'));
     const assets = await response.json();
     const assetsToCache = [
-      ...assets,
+      ...assets.map(appPath),
       // Dynamically added packages
-      "/js/marked/marked.esm.js",
-      "/js/marked-extended-tables/index.js",
-      "/js/marked-alert/index.js",
-      "/js/@highlightjs/highlight.min.js",
-      "/css/@highlightjs/github.min.css",
-      "/css/@highlightjs/github-dark.min.css",
+      appPath('/js/marked/marked.esm.js'),
+      appPath('/js/marked-extended-tables/index.js'),
+      appPath('/js/marked-alert/index.js'),
+      appPath('/js/@highlightjs/highlight.min.js'),
+      appPath('/css/@highlightjs/github.min.css'),
+      appPath('/css/@highlightjs/github-dark.min.css'),
     ];
 
     // If needed, cache highlight.js languages dynamically
@@ -68,7 +70,7 @@ const installNewCache = async (version) => {
     if (highlightLanguages) {
       highlightLanguages.forEach(lang => {
         if (lang.trim()) {
-          assetsToCache.push(`/js/@highlightjs/languages/${lang.trim()}.min.js`);
+          assetsToCache.push(appPath(`/js/@highlightjs/languages/${lang.trim()}.min.js`));
         }
       });
     }

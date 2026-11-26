@@ -1,4 +1,4 @@
-import { marked } from '/js/marked/marked.esm.js';
+import { marked } from '../js/marked/marked.esm.js';
 
 export class CollaborationManager {
     constructor({ userId, userColor, currentNotepadId, operationsManager, editor, onNotepadChange, onUserDisconnect, onCursorUpdate,
@@ -40,7 +40,8 @@ export class CollaborationManager {
     // Initialize WebSocket connection
     setupWebSocket() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}`;
+        const basePath = window.DUMBPAD_BASE_PATH || '';
+        const wsUrl = `${protocol}//${window.location.host}${basePath}/`;
         
         if (this.DEBUG) {
             console.log('Attempting WebSocket connection to:', wsUrl);
@@ -379,4 +380,4 @@ export class CollaborationManager {
     getWSCount() {
         return this.wsCount;
     }
-} 
+}
